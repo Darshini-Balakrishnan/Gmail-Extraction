@@ -35,6 +35,8 @@ import io
 import re
 import json
 import base64
+import secrets
+import hashlib
 from datetime import datetime
 
 import streamlit as st
@@ -147,17 +149,28 @@ COMBINED CONTENT (body + all attachment text):
 """
 
 
+def _generate_pkce_pair():
+    """Manually generate a PKCE verifier/challenge pair. We manage this
+    ourselves (rather than relying on the library's autogenerate_code_verifier)
+    because the verifier needs to survive a full browser redirect out to
+    Google and back - st.session_state isn't reliable for that, since a full
+    page navigation away can reset it. Instead we smuggle the verifier
+    through Google's 'state' parameter, which is guaranteed to round-trip
+    back to us unchanged."""
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
 def get_flow():
     client_config = get_client_config()
     if client_config:
-        return Flow.from_client_config(
-            client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI,
-            autogenerate_code_verifier=True,
-        )
+        return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
     if os.path.exists("client_secret.json"):
         return Flow.from_client_secrets_file(
-            "client_secret.json", scopes=SCOPES, redirect_uri=REDIRECT_URI,
-            autogenerate_code_verifier=True,
+            "client_secret.json", scopes=SCOPES, redirect_uri=REDIRECT_URI
         )
     st.error(
         "No Google OAuth credentials found. If this app is deployed, add a "
@@ -452,16 +465,14 @@ email_input = st.text_input("Your email address (for reference)", placeholder="y
 query_params = st.query_params
 if "code" in query_params and st.session_state.credentials is None:
     flow = get_flow()
-    flow.code_verifier = st.session_state.get("oauth_code_verifier")
+    flow.code_verifier = query_params.get("state")  # restored from Google's round-tripped state param
     try:
         flow.fetch_token(code=query_params["code"])
         st.session_state.credentials = flow.credentials
-        st.session_state.pop("oauth_code_verifier", None)
         st.query_params.clear()
         st.rerun()
     except Exception as e:
         st.query_params.clear()  # the code is now used/dead either way - drop it so a rerun doesn't retry it
-        st.session_state.pop("oauth_code_verifier", None)
         st.error(
             f"Google sign-in failed: {e}\n\n"
             "Common causes: an incomplete/incorrect client_secret in your app's "
@@ -472,8 +483,12 @@ if "code" in query_params and st.session_state.credentials is None:
 
 if st.session_state.credentials is None:
     flow = get_flow()
-    auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
-    st.session_state["oauth_code_verifier"] = flow.code_verifier
+    verifier, challenge = _generate_pkce_pair()
+    auth_url, _ = flow.authorization_url(
+        access_type="offline", include_granted_scopes="true", prompt="consent",
+        code_challenge=challenge, code_challenge_method="S256",
+        state=verifier,  # smuggled through Google's redirect so it survives the round trip
+    )
     st.link_button("🔐 Connect Google Account", auth_url, type="primary")
 else:
     st.success("Google account connected.")
