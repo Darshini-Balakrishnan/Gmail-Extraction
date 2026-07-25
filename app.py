@@ -151,9 +151,18 @@ def get_flow():
     client_config = get_client_config()
     if client_config:
         return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
-    return Flow.from_client_secrets_file(
-        "client_secret.json", scopes=SCOPES, redirect_uri=REDIRECT_URI
+    if os.path.exists("client_secret.json"):
+        return Flow.from_client_secrets_file(
+            "client_secret.json", scopes=SCOPES, redirect_uri=REDIRECT_URI
+        )
+    st.error(
+        "No Google OAuth credentials found. If this app is deployed, add a "
+        "[google_oauth] section with client_id and client_secret in your "
+        "Streamlit app's Settings -> Secrets. If running locally, either add "
+        "the same to .streamlit/secrets.toml, or place a client_secret.json "
+        "file next to app.py."
     )
+    st.stop()
 
 
 def get_anthropic_client():
@@ -439,10 +448,20 @@ email_input = st.text_input("Your email address (for reference)", placeholder="y
 query_params = st.query_params
 if "code" in query_params and st.session_state.credentials is None:
     flow = get_flow()
-    flow.fetch_token(code=query_params["code"])
-    st.session_state.credentials = flow.credentials
-    st.query_params.clear()
-    st.rerun()
+    try:
+        flow.fetch_token(code=query_params["code"])
+        st.session_state.credentials = flow.credentials
+        st.query_params.clear()
+        st.rerun()
+    except Exception as e:
+        st.query_params.clear()  # the code is now used/dead either way - drop it so a rerun doesn't retry it
+        st.error(
+            f"Google sign-in failed: {e}\n\n"
+            "Common causes: an incomplete/incorrect client_secret in your app's "
+            "secrets, or the authorization code expired (codes are one-time use "
+            "and expire quickly). Click 'Connect Google Account' below to get a "
+            "fresh code and try again."
+        )
 
 if st.session_state.credentials is None:
     flow = get_flow()
