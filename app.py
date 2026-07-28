@@ -137,6 +137,18 @@ quantity, unit_price, and total_price must always be a plain number (or null) -
 never a string, never combined with text. Put any unit/text alongside a number
 into the "unit" or "discount_or_terms" field instead.
 
+IMPORTANT - price columns can be labeled many different ways: "Rate", "Unit
+Cost", "Amount", "USD", "Price/Unit", "Value", a bare "$" or currency symbol
+column, or a column header only implying currency without saying "price" at
+all. Check every column in every table/sheet for numeric values that could be
+a per-unit or total price before concluding a price isn't present - do not
+skip a price just because the column isn't literally named "price".
+
+IMPORTANT - if an attachment has multiple sheets, pages, or the item list
+continues beyond what looks like a natural stopping point, keep extracting
+ALL items through to the actual end of the content provided. Do not stop
+early or summarize/truncate the list yourself.
+
 Repeat supplier_company/contact/email/phone identically on EVERY row - do not
 put supplier info in a separate row by itself.
 
@@ -265,6 +277,9 @@ def file_to_text(filename, content):
     return None  # images handled via vision separately
 
 
+INPUT_CHAR_LIMIT = 180000  # generous headroom under the model's context window
+
+
 def claude_extract_combined(client, visible_from, subject, combined_text, images):
     """One call per email: body text + all attachment text combined, plus any
     image attachments passed as real image blocks. This avoids the earlier bug
@@ -272,19 +287,41 @@ def claude_extract_combined(client, visible_from, subject, combined_text, images
     content = []
     for fname, media_type, b64 in images:
         content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}})
-    prompt_text = EXTRACTION_PROMPT.format(
-        visible_from=visible_from, subject=subject,
-        doc_text=(combined_text[:25000] if combined_text.strip() else "[no text content - see attached image(s)]")
-    )
+
+    text_was_truncated = len(combined_text) > INPUT_CHAR_LIMIT
+    doc_text = combined_text[:INPUT_CHAR_LIMIT] if combined_text.strip() else "[no text content - see attached image(s)]"
+    prompt_text = EXTRACTION_PROMPT.format(visible_from=visible_from, subject=subject, doc_text=doc_text)
     content.append({"type": "text", "text": prompt_text})
 
-    msg = client.messages.create(
-        model=ANTHROPIC_MODEL, max_tokens=8192,
-        messages=[{"role": "user", "content": content}],
-    )
+    try:
+        msg = client.messages.create(
+            model=ANTHROPIC_MODEL, max_tokens=8192,
+            messages=[{"role": "user", "content": content}],
+        )
+    except anthropic.APIStatusError as e:
+        st.error(
+            f"Anthropic API error ({e.status_code}): {e.message}\n\n"
+            "Common causes: the model name isn't available to your account/plan, "
+            "you're out of credits, or you've hit a rate limit. Check "
+            "console.anthropic.com -> Plans & Billing and -> the model list "
+            "under API docs to confirm ANTHROPIC_MODEL in app.py is valid for "
+            "your account."
+        )
+        st.stop()
+
     raw = _get_text(msg)
-    truncated = (msg.stop_reason == "max_tokens")
-    return _parse_json(raw, truncated=truncated)
+    output_truncated = (msg.stop_reason == "max_tokens")
+    rows = _parse_json(raw, truncated=output_truncated)
+
+    if text_was_truncated:
+        rows.append({
+            "item_description": "INPUT_TRUNCATED",
+            "notes": f"This email's combined body+attachment content was longer than "
+                     f"{INPUT_CHAR_LIMIT:,} characters and got cut off before reaching "
+                     f"Claude - items near the end of a long attachment/list may be "
+                     f"missing. Consider processing this attachment separately.",
+        })
+    return rows
 
 
 def _get_text(msg):
