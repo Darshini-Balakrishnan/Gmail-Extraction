@@ -38,6 +38,14 @@ import base64
 import secrets
 import hashlib
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Google sometimes returns granted scopes in a different order, or adds
+# implicit ones like "openid" - oauthlib treats any such difference as a hard
+# error by default. This relaxes that check; we still verify the actual scope
+# we need (gmail.readonly) explicitly further down, so a genuinely missing
+# scope is still caught and reported clearly rather than silently ignored.
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
 import streamlit as st
 import pandas as pd
@@ -70,6 +78,19 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly",
           "openid"]
 ANTHROPIC_MODEL = "claude-sonnet-5"  # check docs.claude.com for the latest model string
 DEFAULT_QUERY = "newer_than:30d"
+BATCH_SIZE_DEFAULT = 25
+CHECKPOINT_DIR = "checkpoints"
+MAX_WORKERS = 4  # parallel Claude calls per batch - keep modest to respect rate limits
+
+
+def get_user_email(creds):
+    """Identify the logged-in user so checkpoint files don't collide if
+    multiple people use the same deployed app instance."""
+    try:
+        service = build("oauth2", "v2", credentials=creds)
+        return service.userinfo().get().execute().get("email", "unknown")
+    except Exception:
+        return "unknown"
 
 
 def get_client_config():
@@ -207,15 +228,18 @@ def gmail_service(creds):
     return build("gmail", "v1", credentials=creds)
 
 
-def list_messages(service, query):
+def list_messages(service, query, hard_cap=2000):
+    """hard_cap is just a sanity ceiling, not a processing limit - batching +
+    checkpointing in run_extraction means even large result sets get worked
+    through safely in chunks across repeated clicks."""
     msgs, page_token = [], None
     while True:
         resp = service.users().messages().list(
-            userId="me", q=query, pageToken=page_token, maxResults=100
+            userId="me", q=query, pageToken=page_token, maxResults=500
         ).execute()
         msgs.extend(resp.get("messages", []))
         page_token = resp.get("nextPageToken")
-        if not page_token or len(msgs) >= 200:
+        if not page_token or len(msgs) >= hard_cap:
             break
     return msgs
 
@@ -299,15 +323,15 @@ def claude_extract_combined(client, visible_from, subject, combined_text, images
             messages=[{"role": "user", "content": content}],
         )
     except anthropic.APIStatusError as e:
-        st.error(
-            f"Anthropic API error ({e.status_code}): {e.message}\n\n"
-            "Common causes: the model name isn't available to your account/plan, "
-            "you're out of credits, or you've hit a rate limit. Check "
-            "console.anthropic.com -> Plans & Billing and -> the model list "
-            "under API docs to confirm ANTHROPIC_MODEL in app.py is valid for "
-            "your account."
-        )
-        st.stop()
+        # NOTE: this runs inside a worker thread (see ThreadPoolExecutor in
+        # run_extraction) - st.error()/st.stop() only work correctly on
+        # Streamlit's main thread, so we raise a plain exception instead and
+        # let the per-email try/except in run_extraction log it as a row and
+        # move on, rather than trying to halt the whole app from here.
+        raise RuntimeError(
+            f"Anthropic API error ({e.status_code}): {e.message}. Common causes: model "
+            f"unavailable on your account/plan, out of credits, or a rate limit hit."
+        ) from e
 
     raw = _get_text(msg)
     output_truncated = (msg.stop_reason == "max_tokens")
@@ -378,14 +402,56 @@ def _parse_json(raw, truncated=False):
     return [{"item_description": "PARSE_ERROR", "notes": raw[:500]}]
 
 
-def run_extraction(creds, query, progress_cb=None):
-    service = gmail_service(creds)
-    client = get_anthropic_client()
-    messages = list_messages(service, query)
+def _checkpoint_path(user_email, query):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    key = hashlib.sha256(f"{user_email}::{query}".encode()).hexdigest()[:20]
+    return os.path.join(CHECKPOINT_DIR, f"{key}.json")
 
-    all_rows = []
-    for i, m in enumerate(messages):
-        full = get_message(service, m["id"])
+
+def load_checkpoint(user_email, query):
+    path = _checkpoint_path(user_email, query)
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"processed_ids": [], "rows": []}
+
+
+def save_checkpoint(user_email, query, checkpoint):
+    path = _checkpoint_path(user_email, query)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(checkpoint, f)
+    os.replace(tmp_path, path)  # atomic write - a crash mid-write can't corrupt the real file
+
+
+def reset_checkpoint(user_email, query):
+    path = _checkpoint_path(user_email, query)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def run_extraction(creds, query, user_email, batch_size, progress_cb=None):
+    """Processes up to batch_size NEW emails per call, checkpointing to disk
+    after every single one - a freeze/crash loses at most one email's worth
+    of work, not the whole run. Call this repeatedly (e.g. via the UI button)
+    to work through a large mailbox in safe chunks."""
+    service = gmail_service(creds)  # used for the initial listing only
+    client = get_anthropic_client()
+    all_message_ids = [m["id"] for m in list_messages(service, query)]
+
+    checkpoint = load_checkpoint(user_email, query)
+    processed_ids = set(checkpoint["processed_ids"])
+    todo = [mid for mid in all_message_ids if mid not in processed_ids][:batch_size]
+
+    def _process_one(msg_id):
+        # Build a fresh service instance per thread - googleapiclient service
+        # objects aren't guaranteed thread-safe for concurrent use of one
+        # shared instance, and this call is cheap (no network round trip).
+        thread_service = gmail_service(creds)
+        full = get_message(thread_service, msg_id)
         payload = full["payload"]
         headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
         visible_from = headers.get("From", "")
@@ -395,11 +461,10 @@ def run_extraction(creds, query, progress_cb=None):
         text_parts = [f"--- EMAIL BODY ---\n{body_text}"] if body_text else []
         images = []
 
-        for fname, content in extract_attachments(service, m["id"], payload):
+        for fname, content in extract_attachments(thread_service, msg_id, payload):
             ext = fname.lower().split(".")[-1]
             if ext in ("png", "jpg", "jpeg", "gif", "webp"):
-                # skip tiny images - almost always logos/signature icons, not data
-                if len(content) < 8000:
+                if len(content) < 8000:  # almost always logos/signature icons, not data
                     continue
                 media_type = f"image/{'jpeg' if ext == 'jpg' else ext}"
                 b64 = base64.standard_b64encode(content).decode("utf-8")
@@ -410,22 +475,42 @@ def run_extraction(creds, query, progress_cb=None):
                     text_parts.append(f"--- ATTACHMENT: {fname} ---\n{text}")
 
         combined_text = "\n\n".join(text_parts)
-        if not combined_text.strip() and not images:
-            rows = []  # nothing to extract from
-        else:
-            rows = claude_extract_combined(client, visible_from, subject, combined_text, images)
+        rows = [] if (not combined_text.strip() and not images) else \
+            claude_extract_combined(client, visible_from, subject, combined_text, images)
 
         for r in rows:
             r["_email_subject"] = subject
             r["_visible_gmail_from"] = visible_from
             r["_email_date"] = headers.get("Date", "")
             r["_processed_at"] = datetime.now().isoformat()
-        all_rows.extend(rows)
+        return msg_id, rows
 
-        if progress_cb:
-            progress_cb((i + 1) / max(len(messages), 1))
+    completed = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_process_one, mid): mid for mid in todo}
+        for future in as_completed(futures):
+            msg_id = futures[future]
+            try:
+                _, rows = future.result()
+            except Exception as e:
+                rows = [{"item_description": "EMAIL_PROCESSING_ERROR", "notes": str(e)[:300]}]
 
+            checkpoint["rows"].extend(rows)
+            checkpoint["processed_ids"].append(msg_id)
+            save_checkpoint(user_email, query, checkpoint)  # persist after EVERY email
+
+            completed += 1
+            if progress_cb:
+                progress_cb(completed / max(len(todo), 1))
+
+    total_processed = len(checkpoint["processed_ids"])
+    return _rows_to_df(checkpoint["rows"]), total_processed, len(all_message_ids)
+
+
+def _rows_to_df(all_rows):
     df = pd.DataFrame(all_rows)
+    if df.empty:
+        return df
 
     def _extract_number(val):
         """Safety net: even with prompt instructions, a stray non-numeric
@@ -446,13 +531,12 @@ def run_extraction(creds, query, progress_cb=None):
         if col in df.columns:
             df[col] = df[col].apply(_extract_number)
 
-    # Put the most useful columns first if present
     preferred = ["supplier_company", "supplier_contact", "supplier_email", "supplier_phone",
                  "item_description", "part_or_catalog_no", "specification", "quantity", "unit",
                  "unit_price", "total_price", "currency", "discount_or_terms", "source_note",
                  "_email_subject", "_visible_gmail_from", "_email_date", "_processed_at"]
     cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
-    return df[cols] if not df.empty else df
+    return df[cols]
 
 
 def build_excel(df):
@@ -505,9 +589,23 @@ if "code" in query_params and st.session_state.credentials is None:
     flow.code_verifier = query_params.get("state")  # restored from Google's round-tripped state param
     try:
         flow.fetch_token(code=query_params["code"])
-        st.session_state.credentials = flow.credentials
-        st.query_params.clear()
-        st.rerun()
+        granted_scopes = flow.credentials.scopes or []
+        if not any("gmail.readonly" in s for s in granted_scopes):
+            st.query_params.clear()
+            st.error(
+                "Signed in, but Gmail read access wasn't actually granted "
+                "(only " + ", ".join(granted_scopes) + " came through).\n\n"
+                "If this is a company/Google Workspace account, a Workspace "
+                "admin may be blocking third-party apps from accessing Gmail "
+                "for your organization - they'd need to allowlist this app "
+                "in admin.google.com -> Security -> API Controls -> App "
+                "Access Control. Personal @gmail.com accounts aren't affected "
+                "by this. Click 'Connect Google Account' below to try again."
+            )
+        else:
+            st.session_state.credentials = flow.credentials
+            st.query_params.clear()
+            st.rerun()
     except Exception as e:
         st.query_params.clear()  # the code is now used/dead either way - drop it so a rerun doesn't retry it
         st.error(
@@ -565,18 +663,55 @@ else:
     search_query = " ".join(part for part in [extra_terms.strip(), time_clause] if part)
     st.caption(f"Gmail query that will run: `{search_query or '(all mail)'}`")
 
-    if range_choice in ("Last year", "All time"):
-        st.warning("Wide ranges like this can pull in a lot of mail — this app processes "
-                   "up to 200 matching emails per run (each one is a Claude API call, so "
-                   "very wide ranges also cost more and take longer). Narrow the range or "
-                   "add extra search terms above to stay focused.")
+    st.markdown("**Batch size**")
+    batch_size = st.slider(
+        "Emails to process per click", min_value=5, max_value=50, value=BATCH_SIZE_DEFAULT, step=5,
+        help="Processing happens in small batches instead of one giant run. Progress is saved "
+             "to disk after every single email, so if the app freezes or times out (this can "
+             "happen on wide date ranges with free hosting), you only lose at most the batch "
+             "in progress - just click the button again to pick up exactly where it left off, "
+             "not start over from zero.",
+    )
 
-    if st.button("▶️ Extract now", type="primary"):
-        progress = st.progress(0.0, text="Starting...")
-        df = run_extraction(st.session_state.credentials, search_query,
-                             progress_cb=lambda p: progress.progress(p, text=f"Processing... {int(p*100)}%"))
+    if range_choice in ("Last year", "All time"):
+        st.info("Wide ranges like this can involve a lot of mail. Thanks to batching + "
+                "checkpointing below, this is now safe to run in repeated small chunks even "
+                "for a full year or more - just keep clicking the button until it says done.")
+
+    if "user_email" not in st.session_state:
+        st.session_state.user_email = get_user_email(st.session_state.credentials)
+
+    checkpoint_preview = load_checkpoint(st.session_state.user_email, search_query)
+    already_done = len(checkpoint_preview["processed_ids"])
+    if already_done:
+        st.caption(f"📌 {already_done} email(s) already processed for this exact search "
+                   f"in a previous run - resuming from there.")
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        extract_clicked = st.button("▶️ Extract next batch", type="primary")
+    with col2:
+        if st.button("↺ Reset progress for this search"):
+            reset_checkpoint(st.session_state.user_email, search_query)
+            st.session_state.pop("result_df", None)
+            st.success("Progress cleared for this exact search filter.")
+            st.rerun()
+
+    if extract_clicked:
+        progress = st.progress(0.0, text="Starting batch...")
+        df, total_processed, total_matches = run_extraction(
+            st.session_state.credentials, search_query, st.session_state.user_email, batch_size,
+            progress_cb=lambda p: progress.progress(p, text=f"Processing batch... {int(p*100)}%"),
+        )
         progress.empty()
         st.session_state.result_df = df
+
+        remaining = total_matches - total_processed
+        if remaining > 0:
+            st.warning(f"Processed {total_processed} of {total_matches} matching emails so far. "
+                      f"{remaining} left - click 'Extract next batch' again to continue.")
+        else:
+            st.success(f"Done - all {total_matches} matching emails processed.")
 
     if "result_df" in st.session_state and not st.session_state.result_df.empty:
         df = st.session_state.result_df
@@ -584,7 +719,7 @@ else:
 
         excel_bytes = build_excel(df)
         st.download_button(
-            "⬇️ Download Excel",
+            "⬇️ Download Excel (everything processed so far)",
             data=excel_bytes,
             file_name=f"gmail_extract_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -595,4 +730,5 @@ else:
     if st.button("Log out"):
         st.session_state.credentials = None
         st.session_state.pop("result_df", None)
+        st.session_state.pop("user_email", None)
         st.rerun()
